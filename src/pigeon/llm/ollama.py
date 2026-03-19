@@ -69,4 +69,4 @@ class OllamaBackend(LLMBackend):
             )
         except Exception as e:
             log.error("Ollama error: %s", e)
-            return LLMResponse(text=f"[error: {e}]")
+            return LLMResponse(text="[LLM error — check logs]")

@@ -156,6 +156,15 @@ class PigeonConfig:
             errors.append("max_sessions must be between 1 and 10")
         if self.truncation_limit < 500:
             errors.append("truncation_limit must be at least 500")
+        # Validate save_directory is under home
+        if self.save_directory:
+            save_path = Path(self.save_directory).expanduser().resolve()
+            home = Path.home().resolve()
+            if not str(save_path).startswith(str(home)):
+                errors.append(
+                    f"save_directory must be under your home directory, "
+                    f"got: {save_path}"
+                )
         return errors
 
 

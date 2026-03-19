@@ -344,10 +344,12 @@ def _build_send_app():
         print("  PigeonSend.app already exists, skipping build.")
         return
 
-    applescript = '''
+    home = str(Path.home())
+    tmp_dir = f"{home}/.pigeon/tmp"
+    applescript = f'''
 on run
-    set payloadPath to "/tmp/pigeon-send-payload.txt"
-    set errorPath to "/tmp/pigeon-send-error.log"
+    set payloadPath to "{tmp_dir}/pigeon-send-payload.txt"
+    set errorPath to "{tmp_dir}/pigeon-send-error.log"
 
     try
         set payloadContent to read POSIX file payloadPath as «class utf8»
@@ -413,7 +415,9 @@ def _init_state(chat_ids: list[int]):
 
 
 def _setup_launchd(python_bin: str):
-    """Generate and load launchd plist."""
+    """Generate and load launchd plist using plistlib for safe XML generation."""
+    import plistlib
+
     # Find pigeon entry point
     pigeon_bin = None
     for d in os.environ.get("PATH", "").split(":"):
@@ -422,52 +426,32 @@ def _setup_launchd(python_bin: str):
             pigeon_bin = candidate
             break
 
-    # Fallback: use python -m pigeon.cli
     if pigeon_bin:
-        program_args = f"""    <array>
-        <string>{pigeon_bin}</string>
-        <string>run</string>
-    </array>"""
+        program_args = [pigeon_bin, "run"]
     else:
-        program_args = f"""    <array>
-        <string>{python_bin}</string>
-        <string>-m</string>
-        <string>pigeon.cli</string>
-        <string>run</string>
-    </array>"""
+        program_args = [python_bin, "-m", "pigeon.cli", "run"]
 
     home = str(Path.home())
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LABEL}</string>
-    <key>ProgramArguments</key>
-{program_args}
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>90</integer>
-    <key>StandardOutPath</key>
-    <string>{LOG_DIR}/stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>{LOG_DIR}/stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{home}/.pyenv/shims:{home}/.local/bin</string>
-        <key>HOME</key>
-        <string>{home}</string>
-    </dict>
-</dict>
-</plist>"""
+    plist_data = {
+        "Label": LABEL,
+        "ProgramArguments": program_args,
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 90,
+        "StandardOutPath": str(LOG_DIR / "stdout.log"),
+        "StandardErrorPath": str(LOG_DIR / "stderr.log"),
+        "EnvironmentVariables": {
+            "PATH": (
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+                f":{home}/.pyenv/shims:{home}/.local/bin"
+            ),
+            "HOME": home,
+        },
+    }
 
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PLIST_PATH.write_text(plist)
+    with open(PLIST_PATH, "wb") as f:
+        plistlib.dump(plist_data, f)
     print(f"  Wrote {PLIST_PATH}")
 
     # Unload existing if present

@@ -61,11 +61,13 @@ class SessionManager:
 
     @property
     def last_rowid(self) -> int:
-        return self._state["last_rowid"]
+        with self._state_lock:
+            return self._state["last_rowid"]
 
     @last_rowid.setter
     def last_rowid(self, value: int):
-        self._state["last_rowid"] = value
+        with self._state_lock:
+            self._state["last_rowid"] = value
 
     def save(self):
         with self._state_lock:

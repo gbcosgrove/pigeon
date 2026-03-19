@@ -213,7 +213,8 @@ class PigeonDaemon:
             return
 
         # Decode failure
-        if text == "__DECODE_FAILED__":
+        from pigeon.chatdb import DECODE_FAILED
+        if text == DECODE_FAILED:
             if self.sessions.has_sessions:
                 send_imessage(self._buddy, "[couldn't decode — resend as plain text]")
             return

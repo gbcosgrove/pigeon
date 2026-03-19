@@ -9,6 +9,9 @@ log = logging.getLogger("pigeon")
 
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 
+# Internal sentinel — UUID makes accidental collision with real messages negligible
+DECODE_FAILED = "__PIGEON_DECODE_FAILED_7f3a9b2e4d1c__"
+
 
 @dataclass
 class ChatMessage:
@@ -106,7 +109,7 @@ def poll_messages(chat_ids: list[int], last_rowid: int) -> tuple[list[ChatMessag
         if text:
             messages.append(ChatMessage(rowid=row["ROWID"], text=text))
         elif row["attributedBody"]:
-            messages.append(ChatMessage(rowid=row["ROWID"], text="__DECODE_FAILED__"))
+            messages.append(ChatMessage(rowid=row["ROWID"], text=DECODE_FAILED))
     return messages, new_last_rowid
 
 
