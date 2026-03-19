@@ -37,8 +37,30 @@ DEFAULT_CONFIG = {
         },
     },
     "sessions": {
-        "max": 5,
-        "emojis": ["\U0001F534", "\U0001F535", "\U0001F7E2", "\U0001F7E1", "\U0001F7E3"],
+        "max": 0,  # 0 = unlimited
+        "warn_at": 10,
+        "emojis": [
+            "\U0001f534",
+            "\U0001f535",
+            "\U0001f7e2",
+            "\U0001f7e1",
+            "\U0001f7e3",  # 🔴🔵🟢🟡🟣
+            "\U0001f7e0",
+            "\U0001f7e4",
+            "\u26aa",
+            "\u26ab",
+            "\U0001f535",  # 🟠🟤⚪⚫🔵
+            "\U0001f4a0",
+            "\U0001f4a5",
+            "\U0001f525",
+            "\U00002b50",
+            "\U0001f30a",  # 💠💥🔥⭐🌊
+            "\U0001f341",
+            "\U0001f33b",
+            "\U0001f340",
+            "\U0001f30d",
+            "\U0001f680",  # 🍁🌻🍀🌍🚀
+        ],
     },
     "response": {
         "truncation_limit": 2000,
@@ -54,18 +76,20 @@ DEFAULT_CONFIG = {
         "poll_interval": 5,
         "heartbeat_timeout": 120,
         "working_directory": str(Path.home()),
-        "icon": "\U0001F54A",  # 🕊 dove
+        "icon": "\U0001f54a",  # 🕊 dove
     },
 }
 
 
 def _env_substitute(value: str) -> str:
     """Replace ${VAR_NAME} with environment variable values."""
+
     def _replace(match):
         var_name = match.group(1)
         return os.environ.get(var_name, "")
+
     if isinstance(value, str):
-        return re.sub(r'\$\{(\w+)\}', _replace, value)
+        return re.sub(r"\$\{(\w+)\}", _replace, value)
     return value
 
 
@@ -92,10 +116,10 @@ class PigeonConfig:
     llm_main_model: str | None = None
     llm_triage_backend: str = "claude-cli"
     llm_triage_model: str | None = None
-    max_sessions: int = 5
-    session_emojis: list[str] = field(default_factory=lambda: [
-        "\U0001F534", "\U0001F535", "\U0001F7E2", "\U0001F7E1", "\U0001F7E3"
-    ])
+    max_sessions: int = 0  # 0 = unlimited
+    warn_at_sessions: int = 10
+    session_emojis: list[str] = field(default_factory=lambda: DEFAULT_CONFIG["sessions"]["emojis"])
+    stale_timeout: int = 600  # kill LLM process after N seconds of no output
     truncation_limit: int = 2000
     save_full_responses: bool = True
     save_directory: str = str(RESPONSES_DIR)
@@ -105,7 +129,7 @@ class PigeonConfig:
     poll_interval: int = 5
     heartbeat_timeout: int = 120
     working_directory: str = str(Path.home())
-    icon: str = "\U0001F54A"  # 🕊
+    icon: str = "\U0001f54a"  # 🕊
 
     @classmethod
     def from_dict(cls, data: dict) -> "PigeonConfig":
@@ -130,8 +154,10 @@ class PigeonConfig:
             llm_main_model=llm_main.get("model"),
             llm_triage_backend=llm_triage.get("backend", "claude-cli"),
             llm_triage_model=llm_triage.get("model"),
-            max_sessions=sessions.get("max", 5),
+            max_sessions=sessions.get("max", 0),
+            warn_at_sessions=sessions.get("warn_at", 10),
             session_emojis=sessions.get("emojis", DEFAULT_CONFIG["sessions"]["emojis"]),
+            stale_timeout=daemon.get("stale_timeout", 600),
             truncation_limit=response.get("truncation_limit", 2000),
             save_full_responses=response.get("save_full", True),
             save_directory=response.get("save_directory", str(RESPONSES_DIR)),
@@ -141,7 +167,7 @@ class PigeonConfig:
             poll_interval=daemon.get("poll_interval", 5),
             heartbeat_timeout=daemon.get("heartbeat_timeout", 120),
             working_directory=daemon.get("working_directory", str(Path.home())),
-            icon=daemon.get("icon", "\U0001F54A"),
+            icon=daemon.get("icon", "\U0001f54a"),
         )
 
     def validate(self) -> list[str]:
@@ -152,8 +178,8 @@ class PigeonConfig:
             errors.append(f"Unknown main LLM backend: {self.llm_main_backend}")
         if self.llm_triage_backend not in ("claude-cli", "anthropic", "openai", "ollama"):
             errors.append(f"Unknown triage LLM backend: {self.llm_triage_backend}")
-        if self.max_sessions < 1 or self.max_sessions > 10:
-            errors.append("max_sessions must be between 1 and 10")
+        if self.max_sessions < 0:
+            errors.append("max_sessions must be 0 (unlimited) or positive")
         if self.truncation_limit < 500:
             errors.append("truncation_limit must be at least 500")
         # Validate save_directory is under home
@@ -161,10 +187,7 @@ class PigeonConfig:
             save_path = Path(self.save_directory).expanduser().resolve()
             home = Path.home().resolve()
             if not str(save_path).startswith(str(home)):
-                errors.append(
-                    f"save_directory must be under your home directory, "
-                    f"got: {save_path}"
-                )
+                errors.append(f"save_directory must be under your home directory, got: {save_path}")
         return errors
 
 

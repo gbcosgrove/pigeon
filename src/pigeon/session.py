@@ -3,6 +3,7 @@
 import json
 import logging
 import queue
+import random
 import threading
 from pathlib import Path
 
@@ -80,12 +81,13 @@ class SessionManager:
                  "Heard...", "Working on it...", "Let me check..."]
     _ACKS_FOLLOWUP = ["Got it...", "Copy...", "Heard...", "Checking...",
                       "On it...", "Thinking..."]
-    _ACKS_STATUS = ["Retrieving...", "Pulling status...", "Checking sessions..."]
-    _ACKS_END = ["Wrapping up.", "Closing out.", "Done.", "Ended."]
-    _ACKS_END_ALL = ["All sessions ended.", "Everything closed.", "All wrapped up."]
+    _ACKS_STATUS = ["Retrieving...", "Pulling status...", "Checking sessions...",
+                     "Let me see..."]
+    _ACKS_END = ["Wrapping up.", "Closing out.", "Done.", "Ended.", "Shutting down."]
+    _ACKS_END_ALL = ["All sessions ended.", "Everything closed.", "All wrapped up.",
+                      "Shutting it all down."]
 
     def _ack(self, pool: list[str]) -> str:
-        import random
         return f"{self._icon} {random.choice(pool)}"
 
     def _send_msg(self, text: str):
