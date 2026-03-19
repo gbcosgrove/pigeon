@@ -19,7 +19,7 @@ You (iPhone) → iMessage → Messages.app → chat.db → Pigeon → LLM → iM
 
 ## Features
 
-- **Multi-session** — Run up to 5 concurrent AI conversations with emoji labels (🔴🔵🟢🟡🟣)
+- **Multi-session** — Run unlimited concurrent AI conversations with emoji labels (🔴🔵🟢🟡🟣 and 15 more)
 - **Triage** — Cheap model pre-classifies messages for faster response
 - **Pluggable LLM backends** — Claude CLI, Anthropic API, OpenAI API, Ollama (local)
 - **Truncation + expand** — Long responses truncated for iMessage; reply to get the full text
@@ -98,7 +98,7 @@ llm:
     model: null
 
 sessions:
-  max: 5
+  max: 0                   # 0 = unlimited
 
 response:
   truncation_limit: 2000
@@ -123,6 +123,7 @@ pigeon run -v
 | `<message>` | Continue the front session |
 | `1: <message>` | Send to session 1 (and switch to it) |
 | `🔴 <message>` | Send to the red session |
+| `pigeon:1` | Switch to session 1 (no message sent) |
 | `pigeon:status` | Show all active sessions |
 | `pigeon:off` | End all sessions |
 | `pigeon:off 1` | End session 1 |

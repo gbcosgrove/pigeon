@@ -29,6 +29,7 @@ class PigeonDaemon:
         self.main_backend = get_backend(
             self.config.llm_main_backend,
             working_directory=self.config.working_directory,
+            stale_timeout=self.config.stale_timeout,
         )
         self.triage_backend = get_backend(
             self.config.llm_triage_backend,
@@ -117,10 +118,12 @@ class PigeonDaemon:
         self.sessions.restore_sessions()
         self._start_watchdog()
 
-        log.info("Pigeon started. ROWID: %d, sessions: %d, buddy: %s",
-                 self.sessions.last_rowid,
-                 len(self.sessions.sessions),
-                 self._buddy)
+        log.info(
+            "Pigeon started. ROWID: %d, sessions: %d, buddy: %s",
+            self.sessions.last_rowid,
+            len(self.sessions.sessions),
+            self._buddy,
+        )
 
         while True:
             try:
@@ -133,8 +136,7 @@ class PigeonDaemon:
             time.sleep(self.config.poll_interval)
 
     def _poll_cycle(self):
-        messages, new_last_rowid = poll_messages(
-            self.config.chat_ids, self.sessions.last_rowid)
+        messages, new_last_rowid = poll_messages(self.config.chat_ids, self.sessions.last_rowid)
 
         if not self._sent_online:
             self._sent_online = True
@@ -177,7 +179,7 @@ class PigeonDaemon:
         icon = self.config.icon
 
         # Normalize spacing: "pigeon: X" → "pigeon:X"
-        text_norm = re.sub(rf'^{re.escape(trigger)}:\s+', f'{trigger}:', text_lower)
+        text_norm = re.sub(rf"^{re.escape(trigger)}\s*:\s*", f"{trigger}:", text_lower)
 
         # Status
         if text_norm == status_trigger:
@@ -188,18 +190,22 @@ class PigeonDaemon:
 
         # Off
         if text_lower.startswith(off_trigger):
-            rest = text[len(off_trigger):].strip()
+            rest = text[len(off_trigger) :].strip()
             if rest:
                 target = self.sessions.find_session_by_ref(rest)
                 if target:
                     tag = self.sessions._session_tag(self.sessions.sessions[target])
                     self.sessions.end_session(target)
                     remaining = self.sessions.get_status()
-                    send_imessage(self._buddy,
-                                  f"{tag}{self.sessions._ack(self.sessions._ACKS_END)}\n{remaining}")
+                    send_imessage(
+                        self._buddy,
+                        f"{tag}{self.sessions._ack(self.sessions._ACKS_END)}\n{remaining}",
+                    )
                 else:
-                    msg = (f"[unknown session '{rest}'. "
-                           f"Use {self.config.status_keyword} to see active sessions.]")
+                    msg = (
+                        f"[unknown session '{rest}'. "
+                        f"Use {self.config.status_keyword} to see active sessions.]"
+                    )
                     send_imessage(self._buddy, msg)
             else:
                 self.sessions.end_all_sessions()
@@ -214,13 +220,30 @@ class PigeonDaemon:
 
         # Decode failure
         from pigeon.chatdb import DECODE_FAILED
+
         if text == DECODE_FAILED:
             if self.sessions.has_sessions:
                 send_imessage(self._buddy, "[couldn't decode — resend as plain text]")
             return
 
-        # Number prefix: "1: message"
-        num_match = re.match(r'^(\d):?\s+(.+)', text, re.DOTALL)
+        # Switch command: "pigeon:1", "pigeon:2" (just switch front, no message)
+        switch_match = re.match(rf"^{re.escape(trigger)}:(\d+)$", text_norm)
+        if switch_match:
+            target = self.sessions.find_session_by_ref(switch_match.group(1))
+            if target and target in self.sessions.sessions:
+                self.sessions.switch_front(target)
+                tag = self.sessions._session_tag(self.sessions.sessions[target])
+                send_imessage(self._buddy, f"{icon} Switched to {tag.strip()}")
+            else:
+                send_imessage(
+                    self._buddy,
+                    f"[no session {switch_match.group(1)}. "
+                    f"Use {self.config.status_keyword} to see active sessions.]",
+                )
+            return
+
+        # Number prefix: "1: message" (colon required to avoid misrouting)
+        num_match = re.match(r"^(\d):\s+(.+)", text, re.DOTALL)
         if num_match:
             target = self.sessions.find_session_by_ref(num_match.group(1))
             if target and target in self.sessions.sessions:
@@ -228,46 +251,59 @@ class PigeonDaemon:
                 if prompt:
                     self.sessions.switch_front(target)
                     tag = self.sessions._session_tag(self.sessions.sessions[target])
-                    send_imessage(self._buddy,
-                                  f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}")
+                    send_imessage(
+                        self._buddy, f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}"
+                    )
                     self.sessions.sessions[target]["queue"].put({"prompt": prompt})
                 return
 
         # Emoji prefix
         for emoji in list(self.sessions.sessions.keys()):
             if text.startswith(emoji):
-                prompt = text[len(emoji):].strip()
+                prompt = text[len(emoji) :].strip()
                 if prompt:
                     self.sessions.switch_front(emoji)
                     tag = self.sessions._session_tag(self.sessions.sessions[emoji])
-                    send_imessage(self._buddy,
-                                  f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}")
+                    send_imessage(
+                        self._buddy, f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}"
+                    )
                     self.sessions.sessions[emoji]["queue"].put({"prompt": prompt})
                 return
 
         # New session trigger
         trigger_with_colon = trigger + ":"
         if text_lower.startswith(trigger_with_colon):
-            prompt = text[len(trigger_with_colon):].strip()
+            prompt = text[len(trigger_with_colon) :].strip()
             if not prompt:
                 send_imessage(self._buddy, "[empty prompt]")
                 return
-            if len(self.sessions.sessions) >= self.config.max_sessions:
+            # Hard cap (0 = unlimited)
+            if self.config.max_sessions and len(self.sessions.sessions) >= self.config.max_sessions:
                 send_imessage(
                     self._buddy,
                     f"[max {self.config.max_sessions} sessions. End one first — "
-                    f"{self.config.status_keyword} to see them.]")
+                    f"{self.config.status_keyword} to see them.]",
+                )
                 return
             send_imessage(self._buddy, self.sessions._ack(self.sessions._ACKS_NEW))
+            # Soft warning
+            count = len(self.sessions.sessions)
+            if count >= self.config.warn_at_sessions:
+                send_imessage(
+                    self._buddy,
+                    f"[{icon} {count + 1} active sessions. "
+                    f"Consider ending some with {self.config.off_keyword}]",
+                )
             self.sessions.create_session(prompt)
             return
 
         # No trigger, sessions exist → route to front
-        if (self.sessions.has_sessions
-                and self.sessions.front_session
-                and self.sessions.front_session in self.sessions.sessions):
+        if (
+            self.sessions.has_sessions
+            and self.sessions.front_session
+            and self.sessions.front_session in self.sessions.sessions
+        ):
             front = self.sessions.front_session
             tag = self.sessions._session_tag(self.sessions.sessions[front])
-            send_imessage(self._buddy,
-                          f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}")
+            send_imessage(self._buddy, f"{tag}{self.sessions._ack(self.sessions._ACKS_FOLLOWUP)}")
             self.sessions.sessions[front]["queue"].put({"prompt": text})
