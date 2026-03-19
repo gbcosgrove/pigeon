@@ -71,4 +71,4 @@ class AnthropicBackend(LLMBackend):
             )
         except Exception as e:
             log.error("Anthropic API error: %s", e)
-            return LLMResponse(text=f"[error: {e}]")
+            return LLMResponse(text="[LLM error — check logs]")

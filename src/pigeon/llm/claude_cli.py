@@ -45,11 +45,12 @@ class ClaudeCLIBackend(LLMBackend):
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                cwd=self._working_dir,
+                cwd=self._working_dir, timeout=300,
             )
             if result.returncode != 0:
-                error = (result.stderr or "unknown error")[:500]
-                return LLMResponse(text=f"[error: {error}]")
+                log.error("Claude CLI error (rc=%d): %s",
+                          result.returncode, (result.stderr or "")[:500])
+                return LLMResponse(text="[LLM error — check logs]")
 
             if not result.stdout or not result.stdout.strip():
                 return LLMResponse(text="[no response]")
