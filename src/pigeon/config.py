@@ -192,15 +192,24 @@ class PigeonConfig:
 
 
 def load_config() -> PigeonConfig:
-    """Load config from ~/.pigeon/config.yaml, merged with defaults."""
+    """Load config from ~/.pigeon/config.yaml, merged with defaults.
+
+    The PIGEON_ICON environment variable overrides the config file icon.
+    """
     if not CONFIG_FILE.exists():
-        return PigeonConfig.from_dict(DEFAULT_CONFIG)
+        config = PigeonConfig.from_dict(DEFAULT_CONFIG)
+    else:
+        with open(CONFIG_FILE) as f:
+            user_config = yaml.safe_load(f) or {}
+        merged = _deep_merge(DEFAULT_CONFIG, user_config)
+        config = PigeonConfig.from_dict(merged)
 
-    with open(CONFIG_FILE) as f:
-        user_config = yaml.safe_load(f) or {}
+    # Env var override for icon
+    env_icon = os.environ.get("PIGEON_ICON")
+    if env_icon:
+        config.icon = env_icon
 
-    merged = _deep_merge(DEFAULT_CONFIG, user_config)
-    return PigeonConfig.from_dict(merged)
+    return config
 
 
 def save_config(data: dict) -> None:
