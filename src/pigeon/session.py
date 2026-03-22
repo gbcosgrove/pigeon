@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import queue
 import random
 import threading
@@ -15,14 +16,21 @@ from pigeon.truncation import strip_markdown, truncate_response
 
 log = logging.getLogger("pigeon")
 
+# Backpressure: max queued messages per session before rejecting
+MAX_QUEUE_DEPTH = 5
+
 
 class SessionManager:
     """Manages multiple concurrent AI sessions with emoji labels."""
 
-    def __init__(self, config: PigeonConfig, main_backend: LLMBackend,
-                 triage_backend: LLMBackend | None = None,
-                 database: Database | None = None,
-                 send_fn=None):
+    def __init__(
+        self,
+        config: PigeonConfig,
+        main_backend: LLMBackend,
+        triage_backend: LLMBackend | None = None,
+        database: Database | None = None,
+        send_fn=None,
+    ):
         self.config = config
         self.main_backend = main_backend
         self.triage_backend = triage_backend or main_backend
@@ -42,23 +50,35 @@ class SessionManager:
             if "last_rowid" not in state:
                 raise ValueError("missing last_rowid")
             state.setdefault("last_full_response", "")
+            state.setdefault("last_full_responses", {})
             state.setdefault("sessions", {})
             state.setdefault("front_session", None)
             return state
         except (json.JSONDecodeError, FileNotFoundError, ValueError) as e:
             log.warning("State file issue (%s), resetting", e)
             from pigeon.chatdb import get_max_rowid
+
             max_rowid = get_max_rowid()
-            state = {"last_rowid": max_rowid, "last_full_response": "",
-                     "sessions": {}, "front_session": None}
+            state = {
+                "last_rowid": max_rowid,
+                "last_full_response": "",
+                "last_full_responses": {},
+                "sessions": {},
+                "front_session": None,
+            }
             self._save_state(state)
             return state
 
     def _save_state(self, state: dict | None = None):
+        """Write state atomically via tmp+rename to prevent corruption on crash."""
         state = state or self._state
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(STATE_FILE, "w") as f:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        with tmp.open("w") as f:
             json.dump(state, f)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.rename(STATE_FILE)
 
     @property
     def last_rowid(self) -> int:
@@ -77,15 +97,24 @@ class SessionManager:
     # ── Ack messages ──────────────────────────────────────
 
     # Varied acknowledgment messages for natural feel
-    _ACKS_NEW = ["Got it...", "On it...", "Copy that...", "Roger...",
-                 "Heard...", "Working on it...", "Let me check..."]
-    _ACKS_FOLLOWUP = ["Got it...", "Copy...", "Heard...", "Checking...",
-                      "On it...", "Thinking..."]
-    _ACKS_STATUS = ["Retrieving...", "Pulling status...", "Checking sessions...",
-                     "Let me see..."]
+    _ACKS_NEW = [
+        "Got it...",
+        "On it...",
+        "Copy that...",
+        "Roger...",
+        "Heard...",
+        "Working on it...",
+        "Let me check...",
+    ]
+    _ACKS_FOLLOWUP = ["Got it...", "Copy...", "Heard...", "Checking...", "On it...", "Thinking..."]
+    _ACKS_STATUS = ["Retrieving...", "Pulling status...", "Checking sessions...", "Let me see..."]
     _ACKS_END = ["Wrapping up.", "Closing out.", "Done.", "Ended.", "Shutting down."]
-    _ACKS_END_ALL = ["All sessions ended.", "Everything closed.", "All wrapped up.",
-                      "Shutting it all down."]
+    _ACKS_END_ALL = [
+        "All sessions ended.",
+        "Everything closed.",
+        "All wrapped up.",
+        "Shutting it all down.",
+    ]
 
     def _ack(self, pool: list[str]) -> str:
         return f"{self._icon} {random.choice(pool)}"
@@ -136,7 +165,7 @@ class SessionManager:
         if not emoji:
             return None
 
-        q = queue.Queue()
+        q = queue.Queue(maxsize=MAX_QUEUE_DEPTH)
         session = {
             "emoji": emoji,
             "number": number,
@@ -149,10 +178,14 @@ class SessionManager:
         self._sessions[emoji] = session
 
         if self.database:
-            self.database.log_session(SessionRecord(
-                emoji=emoji, number=number, status="active",
-                prompt_preview=prompt[:200],
-            ))
+            self.database.log_session(
+                SessionRecord(
+                    emoji=emoji,
+                    number=number,
+                    status="active",
+                    prompt_preview=prompt[:200],
+                )
+            )
 
         def _worker():
             log.info("[%s%d] Worker started: %s", emoji, number, prompt[:60])
@@ -165,8 +198,18 @@ class SessionManager:
                     continue
                 if item is None:
                     break
-                self._process_message(
-                    item["prompt"], item.get("first", False), session)
+                # Guard: if session was ended while we were waiting, discard
+                if emoji not in self._sessions:
+                    q.task_done()
+                    break
+                try:
+                    self._process_message(item["prompt"], item.get("first", False), session)
+                except Exception:
+                    log.exception("[%s%d] Error in worker processing", emoji, number)
+                    try:
+                        self._send_msg(f"{self._icon} [error processing message — try again]")
+                    except Exception:
+                        pass
                 q.task_done()
             log.info("[%s%d] Worker stopped", emoji, number)
 
@@ -178,36 +221,39 @@ class SessionManager:
         with self._state_lock:
             self._state["front_session"] = emoji
             self._state["sessions"][emoji] = {
-                "topic": prompt[:50], "session_id": None, "number": number,
+                "topic": prompt[:50],
+                "session_id": None,
+                "number": number,
             }
             self._save_state()
 
         return emoji
 
     def _process_message(self, prompt: str, is_first: bool, session: dict):
+        emoji = session["emoji"]
         tag = self._session_tag(session)
 
         if is_first:
             # Generate topic label in parallel
             topic_thread = threading.Thread(
-                target=self._generate_topic, args=(prompt, session), daemon=True)
+                target=self._generate_topic, args=(prompt, session), daemon=True
+            )
             topic_thread.start()
 
             # Triage
             category, triage_text = triage_message(
-                prompt, self.triage_backend, self.config.llm_triage_model)
+                prompt, self.triage_backend, self.config.llm_triage_model
+            )
 
             topic_thread.join(timeout=15)
             tag = self._session_tag(session)
 
             if category in (TriageResult.TASK, TriageResult.CHECKING):
-                response = self.main_backend.chat(
-                    prompt, model=self.config.llm_main_model)
+                response = self.main_backend.chat(prompt, model=self.config.llm_main_model)
             else:
                 # Triage answered directly — send it
-                self._send_response(triage_text, tag)
-                response = self.main_backend.chat(
-                    prompt, model=self.config.llm_main_model)
+                self._send_response(triage_text, tag, session_emoji=emoji)
+                response = self.main_backend.chat(prompt, model=self.config.llm_main_model)
                 # Don't send main response if triage already answered
                 if response.session_id:
                     self._update_session_id(session, response.session_id)
@@ -217,32 +263,34 @@ class SessionManager:
                 self._update_session_id(session, response.session_id)
 
             if response.cost_usd and self.database:
-                self.database.log_usage(UsageRecord(
-                    session_id=response.session_id or "",
-                    model=response.model,
-                    input_tokens=response.input_tokens or 0,
-                    output_tokens=response.output_tokens or 0,
-                    cost_usd=response.cost_usd or 0.0,
-                ))
+                self.database.log_usage(
+                    UsageRecord(
+                        session_id=response.session_id or "",
+                        model=response.model,
+                        input_tokens=response.input_tokens or 0,
+                        output_tokens=response.output_tokens or 0,
+                        cost_usd=response.cost_usd or 0.0,
+                    )
+                )
 
-            self._send_response(response.text, tag)
+            if emoji in self._sessions:
+                self._send_response(response.text, tag, session_emoji=emoji)
         else:
             resume_id = session.get("session_id")
             response = self.main_backend.chat(
-                prompt, model=self.config.llm_main_model,
-                resume_session=resume_id)
+                prompt, model=self.config.llm_main_model, resume_session=resume_id
+            )
             if response.session_id:
                 self._update_session_id(session, response.session_id)
-            self._send_response(response.text, tag)
+            if emoji in self._sessions:
+                self._send_response(response.text, tag, session_emoji=emoji)
 
     def _generate_topic(self, prompt: str, session: dict):
-        label = generate_topic_label(
-            prompt, self.triage_backend, self.config.llm_triage_model)
+        label = generate_topic_label(prompt, self.triage_backend, self.config.llm_triage_model)
         if label:
             session["topic_label"] = label
             if self.database:
-                self.database.update_session(
-                    session["emoji"], session["number"], topic_label=label)
+                self.database.update_session(session["emoji"], session["number"], topic_label=label)
             log.info("[%s%d] Topic: %s", session["emoji"], session["number"], label)
 
     def _update_session_id(self, session: dict, session_id: str):
@@ -254,27 +302,35 @@ class SessionManager:
             sd["topic_label"] = session.get("topic_label", "")
             self._save_state()
 
-    def _send_response(self, response: str, tag: str = ""):
+    def _send_response(self, response: str, tag: str = "", session_emoji: str = ""):
         response = strip_markdown(response)
         prefix = f"{tag}{self._icon} " if tag else f"{self._icon} "
         full = prefix + response
 
         truncated_text, was_truncated = truncate_response(
-            full, self.config.truncation_limit, self.config.expand_keyword)
+            full, self.config.truncation_limit, self.config.expand_keyword
+        )
 
         if was_truncated and self.config.save_full_responses:
             from datetime import datetime
+
             timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
             save_dir = Path(self.config.save_directory)
             save_dir.mkdir(parents=True, exist_ok=True)
             save_path = save_dir / f"pigeon-response-{timestamp}.md"
-            save_path.write_text(full)
-            log.info("Full response saved to %s", save_path)
+            try:
+                save_path.write_text(full)
+                log.info("Full response saved to %s", save_path)
+            except OSError as e:
+                log.warning("Failed to save full response to file: %s", e)
 
         self._send_msg(truncated_text if was_truncated else full)
 
         with self._state_lock:
-            self._state["last_full_response"] = full if was_truncated else ""
+            if was_truncated:
+                self._state.setdefault("last_full_responses", {})[session_emoji] = full
+            else:
+                self._state.setdefault("last_full_responses", {}).pop(session_emoji, None)
             self._save_state()
 
     # ── Session operations ────────────────────────────────
@@ -283,11 +339,11 @@ class SessionManager:
         session = self._sessions.pop(emoji, None)
         if session:
             session["queue"].put(None)
-            log.info("[%s] Ended: %s",
-                     emoji, session.get("topic_label") or session.get("topic_raw", ""))
+            log.info(
+                "[%s] Ended: %s", emoji, session.get("topic_label") or session.get("topic_raw", "")
+            )
             if self.database:
-                self.database.update_session(
-                    emoji, session.get("number", 0), status="completed")
+                self.database.update_session(emoji, session.get("number", 0), status="completed")
         with self._state_lock:
             self._state["sessions"].pop(emoji, None)
             if self._state.get("front_session") == emoji:
@@ -326,15 +382,21 @@ class SessionManager:
         return "\n".join(lines)
 
     def expand_last(self) -> bool:
-        if self._state.get("last_full_response"):
-            from pigeon.sender import send_chunked
-            # Get buddy from config to send chunks
+        """Expand the last truncated response. Checks per-session first, then legacy global."""
+        from pigeon.sender import send_chunked
+
+        front = self._state.get("front_session", "")
+        responses = self._state.get("last_full_responses", {})
+        full = responses.get(front) or self._state.get("last_full_response", "")
+        if full:
             send_chunked(
                 self.config.chat_identifier,
-                self._state["last_full_response"],
+                full,
                 self.config.truncation_limit,
             )
-            self._state["last_full_response"] = ""
+            with self._state_lock:
+                responses.pop(front, None)
+                self._state["last_full_response"] = ""
             return True
         return False
 
@@ -363,7 +425,7 @@ class SessionManager:
                 if not session_id:
                     continue
                 number = info.get("number", self.config.session_emojis.index(emoji) + 1)
-                q = queue.Queue()
+                q = queue.Queue(maxsize=MAX_QUEUE_DEPTH)
                 session = {
                     "emoji": emoji,
                     "number": number,
@@ -376,18 +438,25 @@ class SessionManager:
                 self._sessions[emoji] = session
 
                 if self.database:
-                    self.database.log_session(SessionRecord(
-                        emoji=emoji, number=number,
-                        topic_label=session.get("topic_label", ""),
-                        status="active", session_id=session_id,
-                        prompt_preview=info.get("topic", "")[:200],
-                    ))
+                    self.database.log_session(
+                        SessionRecord(
+                            emoji=emoji,
+                            number=number,
+                            topic_label=session.get("topic_label", ""),
+                            status="active",
+                            session_id=session_id,
+                            prompt_preview=info.get("topic", "")[:200],
+                        )
+                    )
 
                 def _make_worker(e, s, q_ref):
                     def _worker():
-                        log.info("[%s%d] Worker restored (session=%s)",
-                                 e, s["number"],
-                                 s["session_id"][:8] if s["session_id"] else "none")
+                        log.info(
+                            "[%s%d] Worker restored (session=%s)",
+                            e,
+                            s["number"],
+                            s["session_id"][:8] if s["session_id"] else "none",
+                        )
                         while True:
                             try:
                                 item = q_ref.get(timeout=10)
@@ -397,8 +466,19 @@ class SessionManager:
                                 continue
                             if item is None:
                                 break
-                            self._process_message(item["prompt"], False, s)
+                            if e not in self._sessions:
+                                q_ref.task_done()
+                                break
+                            try:
+                                self._process_message(item["prompt"], False, s)
+                            except Exception:
+                                log.exception("[%s%d] Error in worker", e, s["number"])
+                                try:
+                                    self._send_msg(f"{self._icon} [error processing — try again]")
+                                except Exception:
+                                    pass
                             q_ref.task_done()
+
                     return _worker
 
                 t = threading.Thread(target=_make_worker(emoji, session, q), daemon=True)
@@ -407,3 +487,13 @@ class SessionManager:
                 restored += 1
         if restored:
             log.info("Restored %d session(s) from state", restored)
+
+        # Validate front_session points to a real restored session
+        front = self._state.get("front_session")
+        if front and front not in self._sessions:
+            remaining = list(self._sessions.keys())
+            self._state["front_session"] = remaining[0] if remaining else None
+            log.warning(
+                "front_session %s not restored, reset to %s", front, self._state["front_session"]
+            )
+            self._save_state()

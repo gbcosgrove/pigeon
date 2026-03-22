@@ -139,5 +139,5 @@ class ClaudeCLIBackend(LLMBackend):
                 session_id=session_id,
                 cost_usd=resp.get("total_cost_usd"),
             )
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             return LLMResponse(text=stdout.strip())

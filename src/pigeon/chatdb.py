@@ -66,11 +66,10 @@ def extract_text(text_col: str | None, attr_body_col: bytes | None) -> str | Non
 
 
 def get_max_rowid() -> int:
-    """Get the current maximum message ROWID."""
+    """Get current max ROWID from chat.db. Returns 0 on failure."""
     try:
-        conn = _connect()
-        result = conn.execute("SELECT MAX(ROWID) FROM message").fetchone()[0] or 0
-        conn.close()
+        with _connect() as conn:
+            result = conn.execute("SELECT MAX(ROWID) FROM message").fetchone()[0] or 0
         return result
     except (sqlite3.OperationalError, sqlite3.DatabaseError):
         return 0
@@ -80,6 +79,7 @@ def poll_messages(chat_ids: list[int], last_rowid: int) -> tuple[list[ChatMessag
     """Poll for new messages in the specified chats since last_rowid.
 
     Returns (messages, new_last_rowid).
+    Returns -1 as new_last_rowid if TCC authorization was denied (sentinel).
     """
     if not chat_ids:
         return [], last_rowid
@@ -87,6 +87,8 @@ def poll_messages(chat_ids: list[int], last_rowid: int) -> tuple[list[ChatMessag
     placeholders = ",".join("?" for _ in chat_ids)
     try:
         conn = _connect()
+        # Fail fast if Messages.app holds a write lock — prevents infinite block
+        conn.execute("PRAGMA busy_timeout = 5000")
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             f"""SELECT m.ROWID, m.text, m.attributedBody
@@ -98,7 +100,11 @@ def poll_messages(chat_ids: list[int], last_rowid: int) -> tuple[list[ChatMessag
         ).fetchall()
         conn.close()
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
-        log.debug("DB access issue: %s", e)
+        is_auth = "authorization" in str(e).lower()
+        log.warning("DB access issue%s: %s", " (TCC auth denied)" if is_auth else "", e)
+        # Signal auth-denied to caller via sentinel: return -1 as last_rowid
+        if is_auth:
+            return [], -1
         return [], last_rowid
 
     messages = []
@@ -143,13 +149,15 @@ def detect_self_chats() -> list[ChatInfo]:
 
         chats = []
         for row in rows:
-            chats.append(ChatInfo(
-                rowid=row["ROWID"],
-                identifier=row["chat_identifier"] or "",
-                display_name=row["display_name"] or "",
-                message_count=row["msg_count"],
-                last_message=(row["last_msg"] or "")[:80],
-            ))
+            chats.append(
+                ChatInfo(
+                    rowid=row["ROWID"],
+                    identifier=row["chat_identifier"] or "",
+                    display_name=row["display_name"] or "",
+                    message_count=row["msg_count"],
+                    last_message=(row["last_msg"] or "")[:80],
+                )
+            )
         return chats
     except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
         log.error("Cannot read chat.db: %s", e)
